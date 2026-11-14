@@ -228,6 +228,8 @@ enum WriteMode {
 struct Pool {
   mapping: os::Mapping,
   used: Vec<bool>,
+  /// The first unit that may be free: every unit preceding it is used.
+  first_free: usize,
   live: usize,
 }
 
@@ -237,6 +239,7 @@ impl Pool {
     Pool {
       mapping,
       used: vec![false; units],
+      first_free: 0,
       live: 0,
     }
   }
@@ -258,24 +261,41 @@ impl Pool {
   }
 
   /// Allocates `size` bytes (a multiple of `UNIT`) within `range`.
+  ///
+  /// Only the units within `range`, from the first that may be free, are
+  /// searched. A pool typically serves the trampolines of many detours created
+  /// at once, none of which is released meanwhile, so searching it from its
+  /// start would take time proportional to the number of detours created.
   fn allocate(&mut self, size: usize, range: &Range<usize>) -> Option<usize> {
     let count = size / UNIT;
     let base = self.mapping.base;
-    let mut run = 0;
+    let pool = self.range();
 
-    for index in 0..self.used.len() {
+    // The units residing entirely within `range`
+    let start = range.start.max(pool.start);
+    let end = range.end.min(pool.end);
+    if end < start.saturating_add(size) {
+      return None;
+    }
+    let units = (start - base).div_ceil(UNIT).max(self.first_free)..(end - base) / UNIT;
+
+    let mut run = 0;
+    for index in units {
       run = if self.used[index] { 0 } else { run + 1 };
       if run < count {
         continue;
       }
 
       let first = index + 1 - count;
-      let address = base + first * UNIT;
-      if range.start <= address && address + size <= range.end {
-        self.used[first..=index].fill(true);
-        self.live += 1;
-        return Some(address);
+      self.used[first..=index].fill(true);
+      if first == self.first_free {
+        self.first_free = self.used[index + 1..]
+          .iter()
+          .position(|used| !used)
+          .map_or(self.used.len(), |offset| index + 1 + offset);
       }
+      self.live += 1;
+      return Some(base + first * UNIT);
     }
 
     None
@@ -286,6 +306,7 @@ impl Pool {
     let units = &mut self.used[first..first + size / UNIT];
     debug_assert!(units.iter().all(|used| *used));
     units.fill(false);
+    self.first_free = self.first_free.min(first);
     self.live -= 1;
   }
 }
@@ -487,5 +508,47 @@ mod tests {
         .windows(2)
         .all(|pair| pair[0].abs_diff(origin) <= pair[1].abs_diff(origin))
     );
+  }
+
+  /// A pool of one allocation granule.
+  fn pool() -> Pool {
+    let origin = pool as *const () as usize;
+    let granularity = os::granularity();
+    let range = origin.saturating_sub(DISTANCE)..origin.saturating_add(DISTANCE);
+    // Serialized with `allocate_near`, which may map the same candidates
+    let _pools = POOLS.lock();
+    free_candidates(origin, &range, granularity, granularity)
+      .into_iter()
+      .find_map(|candidate| os::Mapping::new(candidate, granularity))
+      .map(Pool::new)
+      .expect("mapping a pool")
+  }
+
+  #[test]
+  fn released_units_are_reused_before_later_ones() {
+    let mut pool = pool();
+    let range = 0..usize::MAX;
+    let [a, b, c] = [(); 3].map(|()| pool.allocate(2 * UNIT, &range).expect("allocating"));
+    assert_eq!((b - a, c - b), (2 * UNIT, 2 * UNIT));
+
+    pool.release(b, 2 * UNIT);
+    assert_eq!(pool.allocate(UNIT, &range), Some(b));
+    // The remaining unit of `b` is too small
+    assert_eq!(pool.allocate(2 * UNIT, &range), Some(c + 2 * UNIT));
+    assert_eq!(pool.allocate(UNIT, &range), Some(b + UNIT));
+  }
+
+  #[test]
+  fn only_units_within_range_are_allocated() {
+    let mut pool = pool();
+    let base = pool.range().start;
+    let unit = |index: usize| base + index * UNIT;
+
+    assert_eq!(pool.allocate(UNIT, &(unit(3) + 1..unit(6))), Some(unit(4)));
+    assert_eq!(pool.allocate(2 * UNIT, &(base..unit(3))), Some(base));
+    // Only the unit following `unit(4)` is free within the range
+    assert_eq!(pool.allocate(2 * UNIT, &(unit(4)..unit(6))), None);
+    assert_eq!(pool.allocate(UNIT, &(0..base)), None);
+    assert_eq!(pool.allocate(UNIT, &(unit(2)..unit(3))), Some(unit(2)));
   }
 }
