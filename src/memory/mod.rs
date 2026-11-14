@@ -26,9 +26,52 @@ pub(crate) fn patch_lock() -> impl DerefMut<Target = Registry> {
   PATCH_LOCK.lock()
 }
 
+/// The regions queried whilst a [`RegionCache`] exists.
+static CACHE: Mutex<Option<::alloc::vec::Vec<region::Region>>> = Mutex::new(None);
+
+/// Remembers the memory regions queried until it is dropped.
+///
+/// Creating a detour inspects its target several times (whether it is
+/// executable, how many bytes are readable, whether a hot-patch area precedes
+/// it), and each query is a system call (or, on Linux, a parse of
+/// `/proc/self/maps`). A cache exists only whilst one detour is created, with
+/// the patch lock held, so the regions it remembers are as current as those of
+/// separate queries would be.
+pub(crate) struct RegionCache(());
+
+impl RegionCache {
+  /// Remembers the regions queried from now on.
+  pub fn new() -> Self {
+    *CACHE.lock() = Some(::alloc::vec::Vec::new());
+    RegionCache(())
+  }
+}
+
+impl Drop for RegionCache {
+  fn drop(&mut self) {
+    *CACHE.lock() = None;
+  }
+}
+
+/// Returns the region containing `address` (see [`RegionCache`]).
+fn query(address: usize) -> region::Result<region::Region> {
+  let mut cache = CACHE.lock();
+  let Some(regions) = cache.as_mut() else {
+    drop(cache);
+    return region::query(address as *const u8);
+  };
+
+  if let Some(region) = regions.iter().find(|region| region.as_range().contains(&address)) {
+    return Ok(*region);
+  }
+  let region = region::query(address as *const u8)?;
+  regions.push(region);
+  Ok(region)
+}
+
 /// Returns whether `address` resides in executable memory.
 pub(crate) fn is_executable(address: *const ()) -> Result<bool> {
-  match region::query(address) {
+  match query(address as usize) {
     Ok(region) => Ok(region.is_executable()),
     Err(region::Error::UnmappedRegion) => Ok(false),
     Err(error) => Err(Error::from_region(error)),
@@ -38,25 +81,16 @@ pub(crate) fn is_executable(address: *const ()) -> Result<bool> {
 /// Returns the number of contiguous, readable bytes at `address` (at most
 /// `max`).
 pub(crate) fn readable_len(address: usize, max: usize) -> usize {
-  let Ok(regions) = region::query_range(address as *const u8, max) else {
-    return 0;
-  };
-
   let end = address.saturating_add(max);
   let mut cursor = address;
 
-  for region in regions {
-    let Ok(region) = region else { break };
-    let range = region.as_range();
-
-    if range.start > cursor || !region.is_readable() {
+  // Each region contains the cursor, so consecutive regions are contiguous
+  while cursor < end {
+    let Ok(region) = query(cursor) else { break };
+    if !region.is_readable() {
       break;
     }
-
-    cursor = range.end;
-    if cursor >= end {
-      break;
-    }
+    cursor = region.as_range().end;
   }
 
   cursor.min(end).saturating_sub(address)

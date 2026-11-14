@@ -131,6 +131,7 @@ impl Hook {
     }
 
     let mut registry = memory::patch_lock();
+    let _regions = memory::RegionCache::new();
 
     if !memory::is_executable(target)? || !memory::is_executable(detour)? {
       return Err(Error::NotExecutable);
