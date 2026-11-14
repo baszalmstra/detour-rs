@@ -1,8 +1,8 @@
 //! Transactions, which enable and disable several detours at once.
 
 use crate::error::{Error, Result};
-use crate::hook::Hook;
-use crate::memory;
+use crate::hook::{Hook, Write};
+use crate::memory::{self, Pages};
 use crate::thread::{Suspended, Threads};
 use alloc::vec::Vec;
 
@@ -186,9 +186,10 @@ pub(crate) unsafe fn commit(operations: &[(&Hook, bool)], threads: Threads<'_>) 
   let mut registry = memory::patch_lock();
 
   // Everything requiring allocations is prepared before threads are suspended
+  let mut pages = Pages::query(operations.iter().map(|(hook, _)| hook.patch_range()))?;
   let protections = operations
     .iter()
-    .map(|(hook, _)| hook.protections())
+    .map(|(hook, _)| pages.protections(hook.patch_range()))
     .collect::<Result<Vec<_>>>()?;
   for (hook, _) in operations {
     registry.reserve(hook, operations.len());
@@ -196,6 +197,10 @@ pub(crate) unsafe fn commit(operations: &[(&Hook, bool)], threads: Threads<'_>) 
   let mut applied = Vec::with_capacity(operations.len());
 
   let mut suspended = Suspended::new(threads)?;
+  // The pages of all patches are made writable at once, rather than those of
+  // each patch in turn
+  // SAFETY: Restored below.
+  unsafe { pages.unprotect() };
   let result = (|| {
     for (index, &(hook, enable)) in operations.iter().enumerate() {
       if hook.is_enabled() == enable {
@@ -208,9 +213,13 @@ pub(crate) unsafe fn commit(operations: &[(&Hook, bool)], threads: Threads<'_>) 
         hook.relocate(thread.pc(), change)?;
       }
 
+      let write = match pages.is_writable(&hook.patch_range()) {
+        true => Write::Writable,
+        false => Write::Protect(&protections[index]),
+      };
       // SAFETY: Unsuspended threads do not execute the patch (as guaranteed
       // by the caller), and suspended threads are moved below.
-      let (undo, result) = unsafe { hook.apply(&mut registry, enable, &protections[index]) };
+      let (undo, result) = unsafe { hook.apply(&mut registry, enable, write) };
       // An operation applied despite an error is reverted as well
       if let Some(undo) = undo {
         applied.push((index, undo));
@@ -225,13 +234,17 @@ pub(crate) unsafe fn commit(operations: &[(&Hook, bool)], threads: Threads<'_>) 
     }
     suspended.apply()
   })();
+  // SAFETY: The pages were changed only by the operations applied.
+  let restored = unsafe { pages.restore() };
+  let result = result.and(restored);
 
   if result.is_err() {
     for &(index, undo) in applied.iter().rev() {
+      let write = Write::Protect(&protections[index]);
       // SAFETY: Reverts the operations applied above, in reverse order. The
       // code cannot have been modified since, so this does not fail unless
       // the system call does.
-      unsafe { operations[index].0.revert(&mut registry, undo, &protections[index]) };
+      unsafe { operations[index].0.revert(&mut registry, undo, write) };
     }
   }
 
