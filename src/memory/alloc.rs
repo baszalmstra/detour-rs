@@ -19,6 +19,13 @@ const UNIT: usize = 16;
 /// The maximum number of free regions attempted when mapping a new pool.
 const MAX_CANDIDATES: usize = 64;
 
+/// The distance from the origin within which free memory is first searched
+/// for (see [`allocate_near`]).
+const INITIAL_SCAN_DISTANCE: usize = 16 << 20;
+
+/// The factor by which the distance searched grows, until free memory is found.
+const SCAN_GROWTH: usize = 16;
+
 /// All pools of executable memory.
 static POOLS: Mutex<Vec<Pool>> = Mutex::new(Vec::new());
 
@@ -132,24 +139,35 @@ pub(crate) fn allocate_near(origin: usize, max_distance: usize, size: usize) -> 
   let granularity = os::granularity();
   let pool_size = size.next_multiple_of(granularity);
 
-  for candidate in free_candidates(origin, &range, pool_size, granularity) {
-    // The kernel may choose another address, which may still be in range
-    let Some(mapping) = os::Mapping::new(candidate, pool_size) else {
-      continue;
-    };
+  // The address space is scanned in windows around `origin`, widened until one
+  // contains free memory: each region scanned is a system call (or a line of
+  // `/proc/self/maps`), and free memory is usually found close to the origin.
+  let mut distance = INITIAL_SCAN_DISTANCE.min(max_distance);
+  loop {
+    let window = origin.saturating_sub(distance).max(range.start)
+      ..origin.saturating_add(distance).min(range.end);
+    for candidate in free_candidates(origin, &window, pool_size, granularity) {
+      // The kernel may choose another address, which may still be in range
+      let Some(mapping) = os::Mapping::new(candidate, pool_size) else {
+        continue;
+      };
 
-    if range.start <= mapping.base && mapping.base + mapping.len <= range.end {
-      let mut pool = Pool::new(mapping);
-      let address = pool
-        .allocate(size, &range)
-        .expect("allocating from a new pool");
-      let block = pool.block(address, size);
-      pools.push(pool);
-      return Ok(block);
+      if range.start <= mapping.base && mapping.base + mapping.len <= range.end {
+        let mut pool = Pool::new(mapping);
+        let address = pool
+          .allocate(size, &range)
+          .expect("allocating from a new pool");
+        let block = pool.block(address, size);
+        pools.push(pool);
+        return Ok(block);
+      }
     }
-  }
 
-  Err(Error::NoNearbyMemory)
+    if distance >= max_distance {
+      return Err(Error::NoNearbyMemory);
+    }
+    distance = distance.saturating_mul(SCAN_GROWTH).min(max_distance);
+  }
 }
 
 /// Returns addresses of unmapped memory suitable for a pool, ordered by their
