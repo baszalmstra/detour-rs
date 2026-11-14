@@ -173,9 +173,15 @@ impl Layout {
   }
 }
 
+/// The code of a relocated prolog, and the offsets of its instructions in the
+/// target paired with those in the code (see [`Site::relocated`]).
+type Relocated = (Vec<u8>, Vec<(u32, u32)>);
+
 /// The instructions of a target that are replaced by the detour jump.
 struct Prolog {
   instructions: Vec<Instruction>,
+  /// The bytes the instructions were decoded from.
+  bytes: Vec<u8>,
   /// The number of bytes spanned by the instructions.
   len: usize,
   /// Whether the target returns, or unconditionally leaves, within the prolog.
@@ -267,6 +273,7 @@ impl Prolog {
 
     Ok(Prolog {
       instructions,
+      bytes: bytes[..len].to_vec(),
       len,
       terminated,
     })
@@ -285,6 +292,96 @@ impl Prolog {
   /// Returns the trampoline, and the offsets of the relocated instructions
   /// (see [`Site::relocated`]).
   fn relocate(&self, target: usize) -> Result<(CodeBlock, Vec<(u32, u32)>)> {
+    let jumps = usize::from(!self.terminated);
+    let capacity = self.len + (self.instructions.len() + jumps) * MAX_RELOCATED_LEN;
+    let mut trampoline = memory::allocate_near(target, MAX_DISTANCE, capacity)?;
+
+    // Most prologs only need their 32-bit displacements adjusted (as
+    // Microsoft Detours relocates them), which avoids the block encoder:
+    // initializing its tables takes longer than relocating dozens of prologs.
+    let (code, relocated) = match self.copy(target, trampoline.address()) {
+      Some(copied) => copied,
+      None => self.encode(target, trampoline.address())?,
+    };
+
+    if code.len() > trampoline.len() {
+      return Err(Error::UnsupportedInstruction);
+    }
+
+    // SAFETY: The trampoline has just been allocated, and cannot be executing.
+    unsafe { trampoline.write(&code)? };
+    Ok((trampoline, relocated))
+  }
+
+  /// Copies the prolog to `destination`, adjusting each 32-bit displacement
+  /// (of a RIP-relative operand, or a branch outside of the prolog), followed
+  /// by a `jmp rel32` back unless the prolog terminates. Each instruction
+  /// keeps its offset.
+  ///
+  /// Returns `None` if the prolog requires more than that (e.g. a `rel8`
+  /// branch, a displacement out of reach, or an instruction generated whilst
+  /// decoding), which [`Prolog::encode`] handles.
+  fn copy(&self, target: usize, destination: usize) -> Option<Relocated> {
+    let bytes = &self.bytes[..];
+    let mut decoder = Decoder::with_ip(BITNESS, bytes, target as u64, DecoderOptions::NONE);
+    let prolog = target as u64..(target + self.len) as u64;
+
+    let mut code = Vec::with_capacity(self.len + JMP_REL32_LEN);
+    code.extend_from_slice(bytes);
+    let mut relocated = Vec::with_capacity(self.instructions.len());
+    for instruction in &self.instructions {
+      // Every instruction must be the one decoded at its offset
+      let offset = (instruction.ip() - target as u64) as usize;
+      if instruction.is_invalid() || instruction.len() == 0 || decoder.position() != offset {
+        return None;
+      }
+      let decoded = decoder.decode();
+      if decoded.len() != instruction.len() {
+        return None;
+      }
+      relocated.push((offset as u32, offset as u32));
+
+      let constants = decoder.get_constant_offsets(&decoded);
+      let (field, size, referenced) = if decoded.is_ip_rel_memory_operand() {
+        let size = constants.displacement_size();
+        (constants.displacement_offset(), size, decoded.ip_rel_memory_address())
+      } else if let Some(branch) = near_branch_target(&decoded) {
+        // A branch to an instruction of the prolog continues in the trampoline
+        let branch = match prolog.contains(&branch) {
+          true => destination as u64 + (branch - target as u64),
+          false => branch,
+        };
+        (constants.immediate_offset(), constants.immediate_size(), branch)
+      } else {
+        continue;
+      };
+      if size != 4 {
+        return None;
+      }
+
+      let next = destination + offset + decoded.len();
+      let displacement = rel32(next, referenced as usize)?;
+      let field = offset + field;
+      code[field..field + 4].copy_from_slice(&displacement.to_le_bytes());
+    }
+    if decoder.position() != self.len {
+      return None;
+    }
+
+    if !self.terminated {
+      // Resume execution after the prolog in the original function
+      let displacement = rel32(destination + self.len + JMP_REL32_LEN, target + self.len)?;
+      code.push(0xE9);
+      code.extend_from_slice(&displacement.to_le_bytes());
+    }
+    Some((code, relocated))
+  }
+
+  /// Encodes the prolog at `destination`, using the block encoder: relative
+  /// branches and RIP-relative operands are adjusted for their new location
+  /// (rewritten if out of reach), and branches to relocated instructions are
+  /// redirected.
+  fn encode(&self, target: usize, destination: usize) -> Result<Relocated> {
     let mut instructions = self.instructions.clone();
 
     if !self.terminated {
@@ -303,20 +400,10 @@ impl Prolog {
       instructions.push(jump);
     }
 
-    let capacity = self.len + instructions.len() * MAX_RELOCATED_LEN;
-    let mut trampoline = memory::allocate_near(target, MAX_DISTANCE, capacity)?;
-
-    // Relative branches and RIP-relative operands are adjusted for their new
-    // location, and branches to relocated instructions are redirected.
-    let block = InstructionBlock::new(&instructions, trampoline.address() as u64);
+    let block = InstructionBlock::new(&instructions, destination as u64);
     let encoded =
       BlockEncoder::encode(BITNESS, block, BlockEncoderOptions::RETURN_NEW_INSTRUCTION_OFFSETS)
         .map_err(|_| Error::UnsupportedInstruction)?;
-    let code = encoded.code_buffer;
-
-    if code.len() > trampoline.len() {
-      return Err(Error::UnsupportedInstruction);
-    }
 
     // Generated instructions (e.g. the jump back) have no address in the
     // prolog, and rewritten instructions have no offset (`u32::MAX`).
@@ -327,10 +414,7 @@ impl Prolog {
       .filter(|(instruction, offset)| prolog.contains(&instruction.ip()) && *offset != u32::MAX)
       .map(|(instruction, offset)| ((instruction.ip() - target as u64) as u32, offset))
       .collect();
-
-    // SAFETY: The trampoline has just been allocated, and cannot be executing.
-    unsafe { trampoline.write(&code)? };
-    Ok((trampoline, relocated))
+    Ok((encoded.code_buffer, relocated))
   }
 }
 
