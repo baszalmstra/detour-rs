@@ -95,6 +95,16 @@ pub(crate) enum Undo {
   Disabled { position: usize },
 }
 
+/// How a hook writes the target's code (see [`Hook::apply`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Write<'a> {
+  /// The pages of the patch are made writable, and restored to these
+  /// protections afterwards.
+  Protect(&'a Protections),
+  /// The pages of the patch are writable already (see [`memory::Pages`]).
+  Writable,
+}
+
 /// The building block of all detour types.
 pub struct Hook {
   target: usize,
@@ -208,12 +218,13 @@ impl Hook {
   }
 
   /// Returns the range of patched bytes.
-  fn patch_range(&self) -> Range<usize> {
+  pub(crate) fn patch_range(&self) -> Range<usize> {
     let start = self.patch_address as usize;
     start..start + self.original.len()
   }
 
   /// Queries the protection of the patched bytes (see [`Hook::apply`]).
+  #[cfg(test)]
   pub(crate) fn protections(&self) -> Result<Protections> {
     Protections::query(self.patch_address, self.original.len())
   }
@@ -241,12 +252,7 @@ impl Hook {
   /// # Safety
   ///
   /// No thread may execute the patched bytes whilst they are written.
-  pub(crate) unsafe fn apply(
-    &self,
-    registry: &mut Registry,
-    enable: bool,
-    protections: &Protections,
-  ) -> (Option<Undo>, Result<()>) {
+  pub(crate) unsafe fn apply(&self, registry: &mut Registry, enable: bool, write: Write<'_>) -> (Option<Undo>, Result<()>) {
     let site = registry.site(self.target);
     let link: *const Link = &**self.link;
     let trampoline = site.code.trampoline.address();
@@ -260,7 +266,7 @@ impl Hook {
 
       let expected = last.map_or(&*self.original, |last| &*last.patched);
       // SAFETY: Forwarded from the caller.
-      let (written, result) = unsafe { self.replace(expected, &self.link.patched, protections) };
+      let (written, result) = unsafe { self.replace(expected, &self.link.patched, write) };
       if !written {
         self.link.next.store(trampoline, Ordering::SeqCst);
         return (None, result);
@@ -282,7 +288,7 @@ impl Hook {
       let replacement = previous.map_or(&*self.original, |previous| unsafe { &*(*previous).patched });
       let written;
       // SAFETY: Forwarded from the caller.
-      (written, result) = unsafe { self.replace(&self.link.patched, replacement, protections) };
+      (written, result) = unsafe { self.replace(&self.link.patched, replacement, write) };
       if !written {
         return (None, result);
       }
@@ -307,12 +313,12 @@ impl Hook {
   /// # Safety
   ///
   /// See [`Hook::apply`].
-  pub(crate) unsafe fn revert(&self, registry: &mut Registry, undo: Undo, protections: &Protections) {
+  pub(crate) unsafe fn revert(&self, registry: &mut Registry, undo: Undo, write: Write<'_>) {
     let Undo::Disabled { position } = undo else {
       // Unless the revert of a subsequent operation (disabling it) failed
       if self.is_enabled() {
         // SAFETY: Forwarded from the caller.
-        let _ = unsafe { self.apply(registry, false, protections) };
+        let _ = unsafe { self.apply(registry, false, write) };
       }
       return;
     };
@@ -329,7 +335,7 @@ impl Hook {
     if position == site.chain.len() {
       let expected = previous.map_or(&*self.original, |previous| &*previous.patched);
       // SAFETY: Forwarded from the caller.
-      let (written, _) = unsafe { self.replace(expected, &self.link.patched, protections) };
+      let (written, _) = unsafe { self.replace(expected, &self.link.patched, write) };
       if !written {
         self.link.next.store(trampoline, Ordering::SeqCst);
         return;
@@ -350,7 +356,7 @@ impl Hook {
   /// # Safety
   ///
   /// See [`Hook::apply`].
-  unsafe fn replace(&self, expected: &[u8], replacement: &[u8], protections: &Protections) -> (bool, Result<()>) {
+  unsafe fn replace(&self, expected: &[u8], replacement: &[u8], write: Write<'_>) -> (bool, Result<()>) {
     // Refuse to overwrite code that has been modified by someone else
     // SAFETY: The patch area is readable (it was read upon creation).
     let current = || unsafe { core::slice::from_raw_parts(self.patch_address, expected.len()) };
@@ -358,9 +364,15 @@ impl Hook {
       return (false, Err(Error::TargetModified));
     }
 
-    // SAFETY: The replacement is either the original code, or a branch to a
-    // detour that has been verified during creation.
-    let result = unsafe { memory::patch_code(self.patch_address, replacement, protections) };
+    let result = match write {
+      // SAFETY: The replacement is either the original code, or a branch to a
+      // detour that has been verified during creation.
+      Write::Protect(protections) => unsafe {
+        memory::patch_code(self.patch_address, replacement, protections)
+      },
+      // SAFETY: As above, and the caller made the patch area writable.
+      Write::Writable => unsafe { memory::write_code(self.patch_address, replacement) },
+    };
     // The code may have been written despite an error (e.g. if the protection
     // could not be restored), in which case the state must follow the code.
     // Otherwise the trampoline could be released whilst still in use.
@@ -453,7 +465,7 @@ impl fmt::Debug for Hook {
 
 #[cfg(test)]
 mod tests {
-  use super::Change;
+  use super::{Change, Write};
   use crate::transaction::private::Sealed;
   use crate::{RawDetour, Result};
   use core::arch::naked_asm;
@@ -670,7 +682,7 @@ mod tests {
     for enable in [true, false] {
       crate::memory::FAIL_AFTER_WRITE.set(Some(0));
       // SAFETY: No other thread is executing `ret5`.
-      let (undo, result) = unsafe { hook.apply(&mut registry, enable, &protections) };
+      let (undo, result) = unsafe { hook.apply(&mut registry, enable, Write::Protect(&protections)) };
       crate::memory::FAIL_AFTER_WRITE.set(None);
 
       // The code was written, so the state is updated nonetheless

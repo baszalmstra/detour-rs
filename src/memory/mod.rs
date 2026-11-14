@@ -6,7 +6,8 @@ pub(crate) use self::alloc::{CodeBlock, allocate_near};
 use crate::error::{Error, Result};
 use crate::hook::Registry;
 use crate::sync::Mutex;
-use core::ops::DerefMut;
+use ::alloc::vec::Vec;
+use core::ops::{DerefMut, Range};
 
 mod alloc;
 #[cfg(target_vendor = "apple")]
@@ -105,36 +106,154 @@ pub(crate) struct Protections {
 
 impl Protections {
   /// Queries the protection of the pages spanned by `len` bytes at `address`.
+  #[cfg(test)]
   pub fn query(address: *const u8, len: usize) -> Result<Self> {
-    let start = region::page::floor(address) as usize;
-    let end = region::page::ceil(address.wrapping_add(len)) as usize;
+    let patch = address as usize..address as usize + len;
+    Pages::query(core::iter::once(patch.clone()))?.protections(patch)
+  }
+
+  fn iter(&self) -> impl Iterator<Item = &(usize, usize, region::Protection)> {
+    self.regions[..self.count].iter()
+  }
+}
+
+/// The pages spanned by the code patches of a transaction, in runs of
+/// contiguous pages, with their protection.
+///
+/// Changing the protection of memory is a system call. Making the pages of
+/// each run writable once (see [`Pages::unprotect`]), rather than those of
+/// each patch, saves most of them when many targets are patched at once, since
+/// targets often share pages.
+pub(crate) struct Pages {
+  /// The runs, ordered by address.
+  runs: Vec<Run>,
+}
+
+/// Contiguous pages spanned by code patches.
+struct Run {
+  pages: Range<usize>,
+  /// The regions of the run, each clipped to it, with their protection.
+  regions: Vec<(Range<usize>, region::Protection)>,
+  /// Whether the pages were made writable (see [`Pages::unprotect`]).
+  writable: bool,
+}
+
+impl Pages {
+  /// Queries the protection of the pages spanned by `patches`.
+  pub fn query(patches: impl IntoIterator<Item = Range<usize>>) -> Result<Self> {
+    let mut spans = patches
+      .into_iter()
+      .map(|patch| {
+        region::page::floor(patch.start as *const u8) as usize
+          ..region::page::ceil(patch.end as *const u8) as usize
+      })
+      .collect::<Vec<_>>();
+    spans.sort_unstable_by_key(|span| span.start);
+
+    let mut runs: Vec<Run> = Vec::new();
+    for span in spans {
+      match runs.last_mut() {
+        Some(run) if span.start <= run.pages.end => run.pages.end = run.pages.end.max(span.end),
+        _ => runs.push(Run {
+          pages: span,
+          regions: Vec::new(),
+          writable: false,
+        }),
+      }
+    }
+
+    for run in &mut runs {
+      let (start, end) = (run.pages.start, run.pages.end);
+      let regions =
+        region::query_range(start as *const u8, end - start).map_err(Error::from_region)?;
+      for region in regions {
+        let region = region.map_err(Error::from_region)?;
+        let range = region.as_range();
+        run.regions.push((range.start.max(start)..range.end.min(end), region.protection()));
+      }
+    }
+    Ok(Pages { runs })
+  }
+
+  /// Returns the run containing `patch`, one of the patches queried.
+  fn run(&self, patch: &Range<usize>) -> &Run {
+    let index = self.runs.partition_point(|run| run.pages.end <= patch.start);
+    &self.runs[index]
+  }
+
+  /// Returns the protection of the pages spanned by `patch`, one of the
+  /// patches queried.
+  pub fn protections(&self, patch: Range<usize>) -> Result<Protections> {
+    let start = region::page::floor(patch.start as *const u8) as usize;
+    let end = region::page::ceil(patch.end as *const u8) as usize;
 
     let mut protections = Protections {
       regions: [(0, 0, region::Protection::NONE); 2],
       count: 0,
     };
-
-    let regions =
-      region::query_range(start as *const u8, end - start).map_err(Error::from_region)?;
-    for region in regions {
-      let region = region.map_err(Error::from_region)?;
-      let range = region.as_range();
+    for (range, protection) in &self.run(&patch).regions {
       let (lower, upper) = (range.start.max(start), range.end.min(end));
+      if lower >= upper {
+        continue;
+      }
 
       // A patch is smaller than a page, so it spans at most two regions
       let slot = protections
         .regions
         .get_mut(protections.count)
         .ok_or(Error::PatchAreaTooSmall)?;
-      *slot = (lower, upper - lower, region.protection());
+      *slot = (lower, upper - lower, *protection);
       protections.count += 1;
     }
-
     Ok(protections)
   }
 
-  fn iter(&self) -> impl Iterator<Item = &(usize, usize, region::Protection)> {
-    self.regions[..self.count].iter()
+  /// Returns whether the pages of `patch`, one of the patches queried, were
+  /// made writable (see [`Pages::unprotect`]).
+  pub fn is_writable(&self, patch: &Range<usize>) -> bool {
+    self.run(patch).writable
+  }
+
+  /// Makes the pages of each run writable (and executable), if possible.
+  ///
+  /// The patches of a run that cannot be made writable (e.g. on Apple
+  /// platforms, which refuse writable & executable code) are written
+  /// individually instead, using [`patch_code`]. This does not allocate.
+  ///
+  /// # Safety
+  ///
+  /// The protection must be restored using [`Pages::restore`].
+  pub unsafe fn unprotect(&mut self) {
+    for run in &mut self.runs {
+      let (start, len) = (run.pages.start as *const u8, run.pages.end - run.pages.start);
+      // SAFETY: The requested protection is a superset of the existing one.
+      run.writable =
+        unsafe { region::protect(start, len, region::Protection::READ_WRITE_EXECUTE) }.is_ok();
+    }
+  }
+
+  /// Restores the protection of the pages made writable, and ensures that the
+  /// code written to them is visible to instruction fetches. Each run is
+  /// restored, even if another fails to be. This does not allocate.
+  ///
+  /// # Safety
+  ///
+  /// The pages must not have been changed since they were queried, but by
+  /// [`Pages::unprotect`].
+  pub unsafe fn restore(&mut self) -> Result<()> {
+    let mut result = Ok(());
+    for run in self.runs.iter_mut().filter(|run| run.writable) {
+      for (range, protection) in &run.regions {
+        // SAFETY: Restores the protection the pages had previously.
+        let restored = unsafe { region::protect(range.start as *const u8, range.len(), *protection) };
+        if let (Ok(()), Err(error)) = (&result, restored) {
+          result = Err(Error::from_region(error));
+        }
+      }
+      flush_instruction_cache(run.pages.start as *const u8, run.pages.end - run.pages.start);
+      run.writable = false;
+    }
+    result
   }
 }
 
@@ -156,11 +275,8 @@ pub(crate) unsafe fn patch_code(
   protections: &Protections,
 ) -> Result<()> {
   #[cfg(test)]
-  {
-    let failing = FAIL_BEFORE_WRITE.replace(FAIL_BEFORE_WRITE.get() >> 1);
-    if failing & 1 != 0 {
-      return Err(Error::Memory(crate::error::OsError::other("simulated failure")));
-    }
+  if fails_before_write() {
+    return Err(Error::Memory(crate::error::OsError::other("simulated failure")));
   }
 
   // SAFETY: The requested protection is a superset of the existing one.
@@ -188,13 +304,54 @@ pub(crate) unsafe fn patch_code(
   if result.is_ok() {
     flush_instruction_cache(address, bytes.len());
     #[cfg(test)]
-    match FAIL_AFTER_WRITE.get() {
-      Some(0) => return Err(Error::Memory(crate::error::OsError::other("simulated failure"))),
-      Some(count) => FAIL_AFTER_WRITE.set(Some(count - 1)),
-      None => {},
+    if fails_after_write() {
+      return Err(Error::Memory(crate::error::OsError::other("simulated failure")));
     }
   }
   result
+}
+
+/// Overwrites code at `address` with `bytes`, in pages made writable by
+/// [`Pages::unprotect`]. The instruction cache is invalidated once their
+/// protection is restored ([`Pages::restore`]). This does not allocate.
+///
+/// # Safety
+///
+/// See [`patch_code`]; the pages must be writable.
+pub(crate) unsafe fn write_code(address: *mut u8, bytes: &[u8]) -> Result<()> {
+  #[cfg(test)]
+  if fails_before_write() {
+    return Err(Error::Memory(crate::error::OsError::other("simulated failure")));
+  }
+
+  // SAFETY: Forwarded from the caller.
+  unsafe { copy_code(address, bytes) };
+
+  #[cfg(test)]
+  if fails_after_write() {
+    return Err(Error::Memory(crate::error::OsError::other("simulated failure")));
+  }
+  Ok(())
+}
+
+/// Whether the next code patch fails before it is written (see
+/// [`FAIL_BEFORE_WRITE`]).
+#[cfg(test)]
+fn fails_before_write() -> bool {
+  FAIL_BEFORE_WRITE.replace(FAIL_BEFORE_WRITE.get() >> 1) & 1 != 0
+}
+
+/// Whether a code patch that was written fails (see [`FAIL_AFTER_WRITE`]).
+#[cfg(test)]
+fn fails_after_write() -> bool {
+  match FAIL_AFTER_WRITE.get() {
+    Some(0) => true,
+    Some(count) => {
+      FAIL_AFTER_WRITE.set(Some(count - 1));
+      false
+    },
+    None => false,
+  }
 }
 
 #[cfg(test)]
